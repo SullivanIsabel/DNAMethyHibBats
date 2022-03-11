@@ -1,0 +1,191 @@
+---
+title: "Hibernationslowsepigeneticaging"
+author: "Isabel Sullivan"
+date: "10/20/2021"
+output: html_document
+---
+
+```{r}
+library(data.table)
+library(readr)
+library(readxl)
+library(tidyverse)
+library(dplyr)
+library(glmnet)
+library(Matrix)
+library(broom)
+library(caret)
+library(lattice)
+set.seed(123)
+
+```
+
+This code performs a comparative analysis of winter to summer DNA samples from the same Eptesicus fuscus individuals. 
+
+To control for age effects, start by taking the residuals from the age relationship (i.e.regression) at each site. Using ages estimated by the epigenetic clock (Wilkinson et al., 2021), modeled (methylation value ~ Age) grouped per site. Then, take the residuals from this regression at each site. For each analysis, the residuals for bats used in said analysis are pulled.
+
+```{r}
+get(load("all_probes_sesame_normalized.Rdata")) #this has beta values for each bat at each CpG site
+raw<-as.data.frame(normalized_betas_sesame)  #putting these betas into a data frame format
+rownames(raw)<-raw$CGid #naming the rownames by the metadata
+rm(normalized_betas_sesame) #unmount to increase code run speed
+raw.t<-t(raw[,-1]) #Transformation so that basenames appear as rows, and CpG sites as columns
+as_tibble(raw.t) #convert to tibble
+```
+
+Selecting only the Eptesicus samples for age estimations.
+
+```{r}
+tojoin <- read.csv("BaseRage.csv") #file has basename and age of each EF samples 
+
+known <- tojoin$Basename #this pulls out the basenames of interest
+
+epfknowna <- raw.t[known, ] #faster way to pull out bats of interest
+
+knowna<- epfknowna %>%    #pipe in bats of interest 
+  as_tibble(., rownames="Basename")%>%   #continue to use tibble and assign rownames
+  gather(., key= "site", value = "m", -Basename) %>%   #ordered by site
+  mutate_at(vars(site), as.factor)%>%   #changing site names as factor
+ mutate_at(vars(m), as.numeric) %>%   #assigning beta values as numeric values
+ left_join(tojoin, .) #this joins age, site, basename, beta value of known Eptesicus fuscus
+
+which(is.na(knowna), arr.ind=TRUE) # to see if any NAs are present
+saveRDS(knowna, file = "joined.RDS") #saving as RDS for future analyses
+
+```
+
+Generating residuals for each individual by CpG site.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(modelr)
+library(tidyverse)
+
+
+#construct model to be used
+fit_mod<- function(df) {
+  lm(m ~ RevAge, data = df)
+}
+
+revageadj<- knowna %>%   
+  group_by(site) %>%
+  nest() %>% #organizes by CpG site
+  mutate(model = map(data, fit_mod), #applying the knownt to the model
+         resids= map2(data, model, modelr::add_residuals)) # setting up the linear model to pull residuals
+
+batty<- revageadj %>% unnest(., resids) #unnesting to access the residuals
+
+speedbat<- batty %>% select(-data, -model) #removing other parameters for faster load time
+
+```
+
+
+Below is code examining the linear regression that produced residuals at each site. This code generates an intercept, coefficient, pvalue, test statistic for each site.
+```{r}
+modelr.tidy<- revageadj %>%
+  mutate(tidied = map(model, broom::tidy))
+
+rat.tidy <- modelr.tidy %>%
+  unnest(tidied) %>%
+  select(site, term, estimate, std.error, statistic, p.value) %>%
+  mutate_at(vars(term), factor) %>%
+    mutate(., term = fct_recode(term, "Intercept" = "(Intercept)")) %>%
+    pivot_wider(.,names_from = term, values_from = c(estimate, std.error, statistic, p.value))#estimate_RevAge is the model coefficient for age
+
+write.csv(rat.tidy, "residualcoef.csv") 
+```
+
+Paired analysis:
+Now paired residuals are filtered out and the band information is then added to the residuals of interest.
+
+```{r}
+library(readxl)
+library(rstatix)
+library(tidyverse)
+
+
+names <- read.csv("Band_Basename.csv",na.strings = c("", "NA")) %>% na.omit 
+keeper.resid<- speedbat %>% filter(Basename %in% names$Basename) #Filter applied to include only paired individuals
+
+hib<-full_join(keeper.resid, names) #joining residuals to basename
+
+#The following bats were sampled three times. In order to examine winter to summer, the middle sample was duplicated for these bats using the code below
+
+Grey49d<- hib %>% filter(Band =="Grey49" & Time %in% c("S", "W21")) %>% #selecting season to duplicate
+  ungroup(.) %>%
+  mutate(Band =  "Grey49.1",
+         Direction = "SW") %>% #adding the direction here
+  mutate(Basename = recode(Basename,
+                           `204529320118_R02C01` = "204529320118_R02C01.1",
+                           `205483080041_R05C01` = "205483080041_R05C01.1")) #recoding the basename to indicate this bat was sampled three times
+
+Red257d<- hib %>% filter(Band =="Red257" & Time %in% c("S", "W21")) %>%
+  ungroup(.) %>%
+  mutate(Band =  "Red257.1",
+         Direction = "SW") %>%
+  mutate(Basename = recode(Basename,
+                           `204529320125_R06C01` = "204529320125_R06C01.1",
+                           `205483080041_R04C01` = "205483080041_R04C01.1"))
+
+hib.resids<-  hib %>%
+  filter(!(Band %in% c("Grey49", "Red257") & Time =="W21")) %>%
+  bind_rows(., Grey49d, Red257d) %>%
+  mutate(., Direction = ifelse(Band %in% c("Grey49", "Red257"), "WS", Direction)) #joining these samples to the residual dataset
+
+saveRDS(hib.resids, file = "hib.resid.RDS") #save as updated residuals
+write.csv(hib.resids, "pairedresidual.csv") #contains all residuals in a csv file
+```
+
+Modeling season and remove bats that had died or moved into room temperature before samples were taken.
+```{r}
+
+sub.hib <- hib.resids%>%  
+ filter(!Band %in% c( "Red257.1", "Blue42", "Blue58", "Blue52")) #Deceased bats or those that were moved into room temperature
+
+
+par2 <- sub.hib %>%
+  ungroup(.)%>%
+  select(site, m, resid, Season, Band) %>% #selecting specific variables to speed up analyses
+  mutate(Season = recode(Season, W = "first", S = "second")) %>% #this ensures that the analysis is run from winter to summer
+  nest_by(site) %>% #Runs the analysis by site 
+  mutate(model = list(nlme::lme(resid ~ Season, random = ~1|Band, data=data)))
+
+tidy2<-par2 %>% select(site, model) %>% as_tibble(.) %>% #used to pull out relevant outputs from the linear model
+  mutate(new.tidy = lapply(model, function(x) broom.mixed::tidy(x, effects="fixed"))) %>%
+  unnest(new.tidy)%>%
+  select(-model)
+
+
+new2<-tidy2 %>%
+  mutate(term= as_factor(term)) %>%
+  mutate(., term = fct_recode(term, "Intercept" = "(Intercept)")) %>% #Recoding intercept variable so it is legible
+  pivot_wider(.,names_from = c(term), values_from = c(estimate, std.error, df, statistic, p.value)) #Selects the variables for the final csv output file
+
+new2$p.adjBY_season <- p.adjust(new2$p.value_Seasonsecond, method = "BY") #Running BY adjustment
+
+write.csv(new2, "pairsseasonout.csv")
+```
+
+--------
+Below, is example code used for plotting the residuals from winter and summer samples.
+```{r}
+library(ggpubr)
+library(dplyr)
+library(ggplot2)
+
+pair.plot1 <- sub.hib %>% 
+   as_tibble(.) %>%
+  select(site, m, resid, Season, Band, Direction) %>%
+  mutate(Season = factor(Season, levels=c("S","W")))
+
+#cg10775708, Distal intergenic, MAZ, winter up
+wup4 <- pair.plot1 %>% filter(site=="cg10775708")
+
+ggpaired(wup4, x = "Season", y = "resid", id="Band", 
+         fill = "Season", line.color = "gray", line.size = 0.2,
+         palette = c("orange", "blue"),
+         title = "cg10775708",
+         xlab="Season", ylab="Residual Methylation",
+legend = "none", ylim = c(-0.2, 0.13))
+```
